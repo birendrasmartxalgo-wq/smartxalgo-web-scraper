@@ -1,0 +1,12 @@
+flask==3.0.0
+flask-cors==4.0.0
+flask-socketio==5.3.6
+simple-websocket==1.0.0
+feedparser==6.0.11
+vaderSentiment==3.3.2
+requests==2.31.0
+beautifulsoup4==4.12.2
+trafilatura==2.0.0
+googlenewsdecoder==0.1.7
+twscrape
+twikit
