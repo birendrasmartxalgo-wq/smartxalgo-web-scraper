@@ -4,7 +4,13 @@ import threading
 from flask import Flask, jsonify, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO
-from scraper import fetch_news, save_news, background_scraper, enrich_items
+from scraper import (
+    fetch_news,
+    save_news,
+    background_scraper,
+    enrich_items,
+    filter_relevant_items,
+)
 
 # =========================
 # CONFIG
@@ -37,7 +43,9 @@ def scrape():
     news = fetch_news()
     if news:
         news = enrich_items(news)
-        save_news(news)
+        news = filter_relevant_items(news)
+        if news:
+            save_news(news)
     all_news = load_saved_news()
     return jsonify(all_news)
 
