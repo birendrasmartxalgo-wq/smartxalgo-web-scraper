@@ -7,9 +7,11 @@ from flask_socketio import SocketIO
 from scraper import (
     fetch_news,
     save_news,
+    save_news_to_pg,
     background_scraper,
     enrich_items,
     filter_relevant_items,
+    push_to_node,
 )
 
 # =========================
@@ -46,6 +48,8 @@ def scrape():
         news = filter_relevant_items(news)
         if news:
             save_news(news)
+            save_news_to_pg(news)
+            push_to_node(news)
     all_news = load_saved_news()
     return jsonify(all_news)
 

@@ -13,9 +13,17 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 import requests
+import websocket
 from bs4 import BeautifulSoup
 
 from scraper_sentiment import score_text, warm_pipeline
+
+try:
+    import psycopg2
+    import psycopg2.extras
+    PSYCOPG2_AVAILABLE = True
+except ImportError:
+    PSYCOPG2_AVAILABLE = False
 
 try:
     from twscrape import API as TwscrapeAPI, gather as twgather
@@ -45,6 +53,14 @@ ON_DISK_MAX     = 2000
 # Per-source cap inside one fetch_news() cycle.
 PER_SOURCE_MAX  = 50
 
+# Node.js uWebSockets.js backend — persistent WS push
+NODE_WS_URL       = os.getenv("NODE_WS_URL", "ws://localhost:3000/ws/ingest")
+NODE_PUSH_RETRIES = 3
+
+# PostgreSQL — persistent storage (local + shared Supabase)
+PG_DSN = os.getenv("DATABASE_URL", "postgresql://easy2crack:easy2crack@127.0.0.1:5434/market-news-smartxalgo")
+PG_DSN_SHARED = os.getenv("DATABASE_URL_SHARED", "postgresql://postgres:Smartxalgo%40101@db.gytjorbckuqnenqlmdei.supabase.co:5432/postgres")
+
 # =========================
 # ARTICLE BODY ENRICHMENT
 # =========================
@@ -62,7 +78,7 @@ RSS_INLINE_HOSTS  = {        # RSS already gives full body, no need to fetch
     "reddit.com",    "www.reddit.com",   "old.reddit.com",
 }
 # Drop items older than this. We only want fresh market news.
-MAX_ITEM_AGE_DAYS = 15
+MAX_ITEM_AGE_DAYS = 10
 EXTRACT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -634,10 +650,32 @@ def is_target_relevant(affected_indices):
     return any(idx in TARGET_INDICES for idx in affected_indices)
 
 
+_REDDIT_QUESTION_RE = re.compile(
+    r"submitted by /u/|"
+    r"\[link\]\s*\[comments\]|"
+    r"open question for the community|"
+    r"what do you think\??|"
+    r"thoughts\??$|"
+    r"how meaningful are these|"
+    r"anyone else notice",
+    re.IGNORECASE,
+)
+
+
+def _is_reddit_question(item):
+    """True if this looks like a Reddit community discussion post rather than
+    actual market news. Checks title, summary, and content."""
+    if item.get("source", "").lower() != "reddit":
+        return False
+    blob = f"{item.get('title', '')} {item.get('summary', '')} {item.get('content', '')}"
+    return bool(_REDDIT_QUESTION_RE.search(blob))
+
+
 def filter_relevant_items(items):
     """Drop noise after enrichment. Keeps only items that are
-    (a) at least MEDIUM impact AND (b) tied to one of the four target
-    indices. Logs per-reason drop counts so we can spot a vocabulary
+    (a) at least MEDIUM impact, (b) tied to one of the four target
+    indices, and (c) not a Reddit community question/discussion post.
+    Logs per-reason drop counts so we can spot a vocabulary
     regression at a glance.
     """
     if not items:
@@ -645,6 +683,7 @@ def filter_relevant_items(items):
     kept = []
     dropped_low = 0
     dropped_off_target = 0
+    dropped_reddit_q = 0
     for it in items:
         if it.get("impact") == "LOW":
             dropped_low += 1
@@ -652,10 +691,13 @@ def filter_relevant_items(items):
         if not is_target_relevant(it.get("affected_indices") or []):
             dropped_off_target += 1
             continue
+        if _is_reddit_question(it):
+            dropped_reddit_q += 1
+            continue
         kept.append(it)
     log.info(
-        "filter_relevant_items: kept %d / %d (dropped %d low-impact, %d off-target)",
-        len(kept), len(items), dropped_low, dropped_off_target,
+        "filter_relevant_items: kept %d / %d (dropped %d low-impact, %d off-target, %d reddit-question)",
+        len(kept), len(items), dropped_low, dropped_off_target, dropped_reddit_q,
     )
     return kept
 
@@ -1533,9 +1575,225 @@ def save_news(news):
 
 
 # =========================
+# NODE.JS WEBSOCKET PUSH
+# =========================
+_ws_conn = None
+_ws_lock = threading.Lock()
+
+
+def _get_ws():
+    """Lazy-connect to the Node uWebSockets.js server. Returns the live
+    connection or None. Thread-safe; reuses the existing socket if alive."""
+    global _ws_conn
+    with _ws_lock:
+        if _ws_conn and _ws_conn.connected:
+            return _ws_conn
+        try:
+            _ws_conn = websocket.create_connection(NODE_WS_URL, timeout=10)
+            log.info("WebSocket connected to Node at %s", NODE_WS_URL)
+            return _ws_conn
+        except Exception as e:
+            log.warning("WebSocket connect to Node failed: %s", e)
+            _ws_conn = None
+            return None
+
+
+def push_to_node(batch):
+    """Send a batch of enriched news items to the Node backend via WebSocket.
+
+    Retries up to NODE_PUSH_RETRIES times with exponential backoff.  Failures
+    are logged but never raised — items are already safe in market_news.json
+    and the Node app can backfill via GET /news on its next startup.
+    """
+    if not batch or not NODE_WS_URL:
+        return
+
+    # Shallow-copy so adding title_fingerprint doesn't mutate the originals
+    # (they may still be used by the SocketIO emit that follows).
+    payload = []
+    for item in batch:
+        doc = dict(item)
+        fp = _title_fingerprint(doc.get("title", ""))
+        if fp:
+            doc["title_fingerprint"] = fp
+        payload.append(doc)
+
+    message = json.dumps({"type": "news_batch", "news": payload})
+
+    for attempt in range(1, NODE_PUSH_RETRIES + 1):
+        ws = _get_ws()
+        if ws is None:
+            if attempt < NODE_PUSH_RETRIES:
+                time.sleep(2 ** (attempt - 1))
+            continue
+        try:
+            ws.send(message)
+            log.info("Pushed %d items to Node via WebSocket", len(payload))
+            return
+        except Exception as e:
+            log.warning(
+                "WebSocket send failed (attempt %d/%d): %s",
+                attempt, NODE_PUSH_RETRIES, e,
+            )
+            # Close the dead socket so _get_ws() reconnects next time.
+            with _ws_lock:
+                global _ws_conn
+                try:
+                    _ws_conn.close()
+                except Exception:
+                    pass
+                _ws_conn = None
+            if attempt < NODE_PUSH_RETRIES:
+                time.sleep(2 ** (attempt - 1))
+
+    log.error(
+        "Failed to push %d items to Node after %d attempts — items saved locally",
+        len(payload), NODE_PUSH_RETRIES,
+    )
+
+
+# =========================
+# POSTGRESQL PERSISTENCE
+# =========================
+_pg_conns = {}   # dsn -> connection
+_pg_lock = threading.Lock()
+
+_PG_UPSERT_SQL = """
+    INSERT INTO market_news (
+        source, title, summary, link, content,
+        published, timestamp, ingested_at,
+        score_raw, score, impact,
+        sentiment, sentiment_label,
+        categories, tickers, affected_indices,
+        relevance_multiplier, title_fingerprint
+    ) VALUES (
+        %(source)s, %(title)s, %(summary)s, %(link)s, %(content)s,
+        %(published)s, %(timestamp)s, %(ingested_at)s,
+        %(score_raw)s, %(score)s, %(impact)s,
+        %(sentiment)s, %(sentiment_label)s,
+        %(categories)s, %(tickers)s, %(affected_indices)s,
+        %(relevance_multiplier)s, %(title_fingerprint)s
+    )
+    ON CONFLICT (link) DO UPDATE SET
+        score_raw           = EXCLUDED.score_raw,
+        score               = EXCLUDED.score,
+        impact              = EXCLUDED.impact,
+        sentiment           = EXCLUDED.sentiment,
+        sentiment_label     = EXCLUDED.sentiment_label,
+        categories          = EXCLUDED.categories,
+        tickers             = EXCLUDED.tickers,
+        affected_indices    = EXCLUDED.affected_indices,
+        relevance_multiplier = EXCLUDED.relevance_multiplier,
+        content             = EXCLUDED.content
+"""
+
+
+def _get_pg(dsn):
+    """Return a live PostgreSQL connection for *dsn*, reconnecting if needed."""
+    with _pg_lock:
+        conn = _pg_conns.get(dsn)
+        if conn and not conn.closed:
+            try:
+                conn.cursor().execute("SELECT 1")
+                return conn
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                _pg_conns.pop(dsn, None)
+        if not PSYCOPG2_AVAILABLE:
+            return None
+        try:
+            conn = psycopg2.connect(dsn)
+            conn.autocommit = False
+            _pg_conns[dsn] = conn
+            log.info("PostgreSQL connected via %s", dsn.split("@")[-1])
+            return conn
+        except Exception as e:
+            log.warning("PostgreSQL connect failed (%s): %s", dsn.split("@")[-1], e)
+            return None
+
+
+def _parse_ts(val):
+    """Best-effort parse a timestamp string to datetime, or None."""
+    if not val:
+        return None
+    if isinstance(val, datetime):
+        return val
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ",
+                "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(val, fmt)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _build_pg_rows(news):
+    """Convert enriched news dicts into rows suitable for the upsert SQL."""
+    rows = []
+    for item in news:
+        fp = _title_fingerprint(item.get("title", ""))
+        rows.append({
+            "source":               item.get("source", ""),
+            "title":                item.get("title", ""),
+            "summary":              item.get("summary", ""),
+            "link":                 item.get("link", ""),
+            "content":              (item.get("content") or "")[:MAX_BODY_CHARS],
+            "published":            _parse_ts(item.get("published")),
+            "timestamp":            _parse_ts(item.get("timestamp")),
+            "ingested_at":          _parse_ts(item.get("ingested_at")) or datetime.now(timezone.utc),
+            "score_raw":            float(item.get("score_raw", 0)),
+            "score":                float(item.get("score", 0)),
+            "impact":               item.get("impact", "LOW"),
+            "sentiment":            float(item.get("sentiment", 0)),
+            "sentiment_label":      item.get("sentiment_label", "neutral"),
+            "categories":           item.get("categories", []),
+            "tickers":              item.get("tickers", []),
+            "affected_indices":     item.get("affected_indices", []),
+            "relevance_multiplier": float(item.get("relevance_multiplier", 1.0)),
+            "title_fingerprint":    fp,
+        })
+    return rows
+
+
+def _upsert_pg(dsn, rows, label):
+    """Upsert rows into a single PG instance identified by *dsn*."""
+    conn = _get_pg(dsn)
+    if conn is None:
+        return
+    try:
+        cur = conn.cursor()
+        psycopg2.extras.execute_batch(cur, _PG_UPSERT_SQL, rows, page_size=100)
+        conn.commit()
+        log.info("PostgreSQL [%s]: upserted %d items", label, len(rows))
+    except Exception as e:
+        log.error("PostgreSQL [%s] upsert failed: %s", label, e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
+def save_news_to_pg(news):
+    """Upsert enriched news items into local + shared PostgreSQL databases.
+
+    Uses ON CONFLICT (link) DO UPDATE so re-scraped items get their
+    scores/sentiment refreshed without creating duplicates.
+    Failures are logged but never fatal — JSON file is the primary store.
+    """
+    if not news or not PSYCOPG2_AVAILABLE:
+        return
+    rows = _build_pg_rows(news)
+    _upsert_pg(PG_DSN, rows, "local")
+    _upsert_pg(PG_DSN_SHARED, rows, "supabase")
+
+
+# =========================
 # BACKGROUND SCRAPER
 # =========================
-def background_scraper(socketio, interval=60):
+def background_scraper(socketio, interval=120):
     log.info("Real-Time Scraper Started (interval=%ss)...", interval)
     consecutive_failures = 0
     while True:
@@ -1546,6 +1804,8 @@ def background_scraper(socketio, interval=60):
                 news = filter_relevant_items(news)
                 if news:
                     save_news(news)
+                    save_news_to_pg(news)
+                    push_to_node(news)
                     socketio.emit("news_update", {"news": news})
                 consecutive_failures = 0
             else:
