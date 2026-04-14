@@ -58,8 +58,7 @@ NODE_WS_URL       = os.getenv("NODE_WS_URL", "ws://localhost:3000/ws/ingest")
 NODE_PUSH_RETRIES = 3
 
 # PostgreSQL — persistent storage (local + shared Supabase)
-PG_DSN = os.getenv("DATABASE_URL", "postgresql://easy2crack:easy2crack@127.0.0.1:5434/market-news-smartxalgo")
-PG_DSN_SHARED = os.getenv("DATABASE_URL_SHARED", "postgresql://postgres:Smartxalgo%40101@db.gytjorbckuqnenqlmdei.supabase.co:5432/postgres")
+PG_DSN = os.getenv("DATABASE_URL", "postgresql://sxa:sxa%402025@127.0.0.1:5432/market_news_analysis_db")
 
 # =========================
 # ARTICLE BODY ENRICHMENT
@@ -1787,7 +1786,6 @@ def save_news_to_pg(news):
         return
     rows = _build_pg_rows(news)
     _upsert_pg(PG_DSN, rows, "local")
-    _upsert_pg(PG_DSN_SHARED, rows, "supabase")
 
 
 # =========================
@@ -1805,7 +1803,6 @@ def background_scraper(socketio, interval=120):
                 if news:
                     save_news(news)
                     save_news_to_pg(news)
-                    push_to_node(news)
                     socketio.emit("news_update", {"news": news})
                 consecutive_failures = 0
             else:

@@ -1,0 +1,25 @@
+[Unit]
+Description=SmartxAlgo Web Scraper (Flask + SocketIO + PostgreSQL)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/var/www/html/smartxalgo-web-scraper
+
+Environment=PORT=8091
+Environment=DATABASE_URL=postgresql://sxa:sxa%402025@127.0.0.1:5432/market_news_analysis_db
+Environment=PYTHONUNBUFFERED=1
+Environment=HF_HOME=/var/www/html/smartxalgo-web-scraper/.hf-cache
+
+ExecStart=/var/www/html/smartxalgo-web-scraper/venv/bin/python /var/www/html/smartxalgo-web-scraper/app.py
+
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
