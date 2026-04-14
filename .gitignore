@@ -208,3 +208,10 @@ __marimo__/
 .hf-cache/
 .pip-cache
 .pip-temp
+
+# Runtime state — not committed
+queue.pointer
+market_news.json
+market_news_old.json
+market_news.json.corrupt-*
+sample.json

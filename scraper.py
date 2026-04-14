@@ -12,6 +12,7 @@ import unicodedata
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
+from difflib import SequenceMatcher
 import requests
 import websocket
 from bs4 import BeautifulSoup
@@ -59,6 +60,16 @@ NODE_PUSH_RETRIES = 3
 
 # PostgreSQL — persistent storage (local + shared Supabase)
 PG_DSN = os.getenv("DATABASE_URL", "postgresql://sxa:sxa%402025@127.0.0.1:5432/market_news_analysis_db")
+
+# Queue processor — reads JSON backlog, dedupes vs DB, writes fresh rows.
+QUEUE_POINTER_FILE     = os.path.join(BASE_DIR, "queue.pointer")
+QUEUE_INTERVAL         = int(os.getenv("QUEUE_INTERVAL", "60"))            # seconds between runs
+SIMILARITY_THRESHOLD   = float(os.getenv("SIMILARITY_THRESHOLD", "0.95"))  # 0..1 — fuzzy dedupe cutoff
+SIMILARITY_WINDOW_DAYS = int(os.getenv("SIMILARITY_WINDOW_DAYS", "2"))     # how far back to compare same-source titles
+
+# Retention — keep only the last N days in PostgreSQL.
+RETENTION_DAYS     = int(os.getenv("RETENTION_DAYS", "10"))
+RETENTION_INTERVAL = int(os.getenv("RETENTION_INTERVAL", str(6 * 3600)))   # run every 6h
 
 # =========================
 # ARTICLE BODY ENRICHMENT
@@ -1776,16 +1787,269 @@ def _upsert_pg(dsn, rows, label):
 
 
 def save_news_to_pg(news):
-    """Upsert enriched news items into local + shared PostgreSQL databases.
+    """Upsert enriched news items directly into PostgreSQL.
 
-    Uses ON CONFLICT (link) DO UPDATE so re-scraped items get their
-    scores/sentiment refreshed without creating duplicates.
-    Failures are logged but never fatal — JSON file is the primary store.
+    Kept for the on-demand /scrape route and for admin/debug use. The
+    normal real-time path goes through process_news_queue() instead so
+    that fuzzy dedupe and pointer-based delta reads can run in one place.
     """
     if not news or not PSYCOPG2_AVAILABLE:
         return
     rows = _build_pg_rows(news)
     _upsert_pg(PG_DSN, rows, "local")
+
+
+# =========================
+# QUEUE PROCESSOR (JSON -> PG)
+# =========================
+_queue_lock = threading.Lock()
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _read_queue_pointer():
+    """Return the high-water mark datetime of the last processed batch."""
+    try:
+        with open(QUEUE_POINTER_FILE, "r") as f:
+            ts = f.read().strip()
+        parsed = _parse_ts(ts)
+        if parsed is None:
+            return _EPOCH
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except FileNotFoundError:
+        return _EPOCH
+    except Exception as e:
+        log.warning("Queue pointer read failed (%s) — restarting from epoch", e)
+        return _EPOCH
+
+
+def _write_queue_pointer(ts):
+    """Persist the latest processed ingested_at atomically."""
+    try:
+        tmp = QUEUE_POINTER_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(ts.isoformat())
+        os.replace(tmp, QUEUE_POINTER_FILE)
+    except Exception as e:
+        log.error("Queue pointer write failed: %s", e)
+
+
+def _similarity(a, b):
+    """Return a 0..1 ratio between two short strings with a length gate.
+
+    SequenceMatcher is O(N*M); titles are short enough for this not to
+    matter, but the length gate short-circuits mismatches instantly.
+    """
+    if not a or not b:
+        return 0.0
+    la, lb = len(a), len(b)
+    m = max(la, lb)
+    if m == 0:
+        return 0.0
+    if min(la, lb) / m < 0.80:
+        return 0.0
+    return SequenceMatcher(None, a.lower(), b.lower(), autojunk=False).ratio()
+
+
+def _fetch_existing_links(links):
+    """Return the subset of *links* already present in market_news."""
+    if not links or not PSYCOPG2_AVAILABLE:
+        return set()
+    conn = _get_pg(PG_DSN)
+    if conn is None:
+        return set()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT link FROM market_news WHERE link = ANY(%s)",
+            (list(links),),
+        )
+        return {row[0] for row in cur.fetchall()}
+    except Exception as e:
+        log.error("Queue: fetch existing links failed: %s", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return set()
+
+
+def _fetch_recent_titles(source, days):
+    """Return titles ingested within the last *days* for *source*."""
+    if not source or not PSYCOPG2_AVAILABLE:
+        return []
+    conn = _get_pg(PG_DSN)
+    if conn is None:
+        return []
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT title FROM market_news "
+            "WHERE source = %s "
+            "  AND ingested_at > NOW() - (%s || ' days')::interval",
+            (source, str(days)),
+        )
+        return [row[0] for row in cur.fetchall() if row[0]]
+    except Exception as e:
+        log.error("Queue: fetch recent titles failed: %s", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return []
+
+
+def process_news_queue():
+    """Process the JSON backlog into PostgreSQL.
+
+    Pipeline:
+      1. Read queue.pointer (high-water mark).
+      2. Load market_news.json and take items with ingested_at > pointer.
+      3. Bulk-check which links already exist in DB (exact match).
+      4. Group by source; for each source, fetch recent titles once and
+         drop incoming items whose title is >= SIMILARITY_THRESHOLD similar
+         to any existing same-source title (fuzzy dedupe).
+      5. Upsert the survivors.
+      6. Advance the pointer to max(ingested_at) of the delta.
+
+    Idempotent — a crashed run just re-reads the same delta next cycle.
+    """
+    if not PSYCOPG2_AVAILABLE:
+        return
+    with _queue_lock:
+        pointer = _read_queue_pointer()
+        try:
+            with open(OUTPUT_FILE, "r") as f:
+                items = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception as e:
+            log.warning("Queue: JSON read failed: %s", e)
+            return
+        if not isinstance(items, list):
+            return
+
+        delta = []
+        max_ts = pointer
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            ts = _parse_ts(it.get("ingested_at"))
+            if ts is None:
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if ts <= pointer:
+                continue
+            delta.append(it)
+            if ts > max_ts:
+                max_ts = ts
+
+        if not delta:
+            return
+
+        log.info("Queue: %d new items since %s", len(delta), pointer.isoformat())
+
+        # Bulk exact-match link check for the whole batch.
+        existing_links = _fetch_existing_links(
+            [i.get("link") for i in delta if i.get("link")]
+        )
+
+        # Group by source so same-source titles are fetched once per source.
+        by_source = {}
+        for it in delta:
+            by_source.setdefault(it.get("source", ""), []).append(it)
+
+        accepted = []
+        exact_skipped = 0
+        fuzzy_skipped = 0
+        for source, src_items in by_source.items():
+            recent_titles = _fetch_recent_titles(source, SIMILARITY_WINDOW_DAYS)
+            for it in src_items:
+                link = it.get("link")
+                if link and link in existing_links:
+                    exact_skipped += 1
+                    continue
+                title = (it.get("title") or "").strip()
+                if not title:
+                    continue
+                dup = False
+                for t in recent_titles:
+                    if _similarity(title, t) >= SIMILARITY_THRESHOLD:
+                        fuzzy_skipped += 1
+                        dup = True
+                        break
+                if dup:
+                    continue
+                accepted.append(it)
+                # Block near-duplicates inside the same batch too.
+                recent_titles.append(title)
+
+        if accepted:
+            rows = _build_pg_rows(accepted)
+            _upsert_pg(PG_DSN, rows, "local")
+
+        log.info(
+            "Queue: accepted=%d exact_dupes=%d fuzzy_dupes=%d",
+            len(accepted), exact_skipped, fuzzy_skipped,
+        )
+
+        _write_queue_pointer(max_ts)
+
+
+def background_queue_processor(interval=None):
+    """Daemon loop: drain the JSON backlog into PostgreSQL periodically."""
+    interval = interval or QUEUE_INTERVAL
+    log.info("Queue processor started (interval=%ss, threshold=%.2f)...",
+             interval, SIMILARITY_THRESHOLD)
+    while True:
+        try:
+            process_news_queue()
+        except Exception as e:
+            log.error("Queue processor error: %s", e)
+        time.sleep(interval)
+
+
+# =========================
+# RETENTION (10-day window)
+# =========================
+def prune_old_news():
+    """Delete rows older than RETENTION_DAYS from market_news."""
+    if not PSYCOPG2_AVAILABLE:
+        return
+    conn = _get_pg(PG_DSN)
+    if conn is None:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM market_news "
+            "WHERE ingested_at < NOW() - (%s || ' days')::interval",
+            (str(RETENTION_DAYS),),
+        )
+        deleted = cur.rowcount
+        conn.commit()
+        log.info("Retention: deleted %d rows older than %d days", deleted, RETENTION_DAYS)
+    except Exception as e:
+        log.error("Retention delete failed: %s", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
+def background_retention(interval=None):
+    """Daemon loop: periodically prune old rows from PostgreSQL."""
+    interval = interval or RETENTION_INTERVAL
+    log.info("Retention worker started (interval=%ss, keep=%d days)...",
+             interval, RETENTION_DAYS)
+    while True:
+        try:
+            prune_old_news()
+        except Exception as e:
+            log.error("Retention worker error: %s", e)
+        time.sleep(interval)
 
 
 # =========================
@@ -1802,7 +2066,6 @@ def background_scraper(socketio, interval=120):
                 news = filter_relevant_items(news)
                 if news:
                     save_news(news)
-                    save_news_to_pg(news)
                     socketio.emit("news_update", {"news": news})
                 consecutive_failures = 0
             else:

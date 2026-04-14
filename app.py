@@ -7,8 +7,9 @@ from flask_socketio import SocketIO
 from scraper import (
     fetch_news,
     save_news,
-    save_news_to_pg,
     background_scraper,
+    background_queue_processor,
+    background_retention,
     enrich_items,
     filter_relevant_items,
 )
@@ -40,14 +41,14 @@ def load_saved_news():
 # =========================
 @app.route("/scrape", methods=["GET"])
 def scrape():
-    """When user clicks Start Scraping, fetch fresh news and return"""
+    """Force a fetch cycle. Writes to JSON only — the background queue
+    processor picks it up, dedupes, and writes to PostgreSQL."""
     news = fetch_news()
     if news:
         news = enrich_items(news)
         news = filter_relevant_items(news)
         if news:
             save_news(news)
-            save_news_to_pg(news)
     all_news = load_saved_news()
     return jsonify(all_news)
 
@@ -71,17 +72,24 @@ def serve_static(path):
     return send_from_directory(app.static_folder, path)
 
 # =========================
-# BACKGROUND SCRAPER WRAPPER
+# BACKGROUND WORKER WRAPPERS
 # =========================
 def start_scraper():
     background_scraper(socketio)
+
+def start_queue_processor():
+    background_queue_processor()
+
+def start_retention():
+    background_retention()
 
 # =========================
 # RUN SERVER
 # =========================
 if __name__ == "__main__":
     print("Starting Flask + WebSocket Server...")
-    scraper_thread = threading.Thread(target=start_scraper, daemon=True)
-    scraper_thread.start()
+    threading.Thread(target=start_scraper,         daemon=True, name="scraper").start()
+    threading.Thread(target=start_queue_processor, daemon=True, name="queue").start()
+    threading.Thread(target=start_retention,       daemon=True, name="retention").start()
     port = int(os.environ.get("PORT", 5000))
     socketio.run(app, host="0.0.0.0", port=port, debug=False, allow_unsafe_werkzeug=True)
