@@ -10,7 +10,7 @@ Group=ubuntu
 WorkingDirectory=/var/www/html/smartxalgo-web-scraper
 
 Environment=PORT=8091
-Environment=DATABASE_URL=postgresql://sxa:sxa%402025@127.0.0.1:5432/market_news_analysis_db
+Environment=DATABASE_URL=postgresql://sxa:sxa%%402025@127.0.0.1:5432/market_news_analysis_db
 Environment=PYTHONUNBUFFERED=1
 Environment=HF_HOME=/var/www/html/smartxalgo-web-scraper/.hf-cache
 
